@@ -5,6 +5,7 @@ import sys
 import click
 
 from commands.base import CommandManifest
+from commands.params import SessionFileType
 from common.core.config import (
     ConfigError,
     load_common_config,
@@ -12,12 +13,13 @@ from common.core.config import (
     requires_common_config,
 )
 from common.llm.registry import discover_providers, get_default_provider_name
+from core.plan_utils import RunPlanFileType
 from core.router import CLIInteractionPlugin, run_router, calculate_run_statistics, format_statistics, _execution_log_to_yaml
 
 
 def register(plugin_manifests: dict) -> CommandManifest:
-    @click.command("run")
-    @click.argument("task")
+    @click.command("exec")
+    @click.argument("plan", type=RunPlanFileType())
     @click.option(
         "--provider",
         "-P",
@@ -95,6 +97,14 @@ def register(plugin_manifests: dict) -> CommandManifest:
         help="Export planned skills to YAML file (use '-' for stdout)",
     )
     @click.option(
+        "--param",
+        "-p",
+        "params",
+        multiple=True,
+        type=str,
+        help="Plan parameter KEY=VALUE (can be repeated). Substitutes {{key}} in plan.",
+    )
+    @click.option(
         "--run-isolated",
         is_flag=True,
         default=False,
@@ -126,8 +136,8 @@ def register(plugin_manifests: dict) -> CommandManifest:
         default=None,
         help="Export only the successfully executed steps to a YAML plan file",
     )
-    def run_cmd(
-        task,
+    def exec_cmd(
+        plan,
         provider,
         model,
         workdir,
@@ -145,14 +155,12 @@ def register(plugin_manifests: dict) -> CommandManifest:
         shared_context,
         interactive,
         export_successful,
+        params,
     ):
-        """Orchestrate multiple skills to accomplish a complex task.
+        """Execute a skill plan from a YAML file.
 
-        The router plans each step using an LLM, then executes skills or
-        free-form tasks directly (no subprocess). Results and context are
-        passed in-memory between steps.
-
-        To execute a plan file instead, use: skill exec <plan.yaml>
+        The plan file contains the goal and step-by-step instructions.
+        Parameters can be substituted using -p KEY=VALUE for {{key}} placeholders.
 
         Isolation modes:
         - Default: skills use the workdir directly (cooperation enabled)
@@ -191,20 +199,45 @@ def register(plugin_manifests: dict) -> CommandManifest:
 
         interaction = _NoAskPlugin() if no_ask else CLIInteractionPlugin()
 
+        # Convert -p KEY=VALUE pairs to dict for plan parameter substitution
+        import_params = {}
+        for p in params:
+            if "=" in p:
+                k, v = p.split("=", 1)
+                import_params[k.strip()] = v.strip()
+            else:
+                click.echo(f"Warning: invalid param format '{p}', expected KEY=VALUE", err=True)
+
         # Create shared context if enabled
         shared_ctx = None
         if shared_context:
             from common.agent.shared_context import SharedContext
             shared_ctx = SharedContext()
 
-        click.echo(f"Router started: '{task}'", err=True)
+        plan_path = str(plan)
+        click.echo(f"Router executing plan: '{plan_path}'", err=True)
         click.echo(f"Provider: {provider_name}, model: {model or 'default'}", err=True)
         click.echo(f"Isolation mode: {isolation_mode}", err=True)
         click.echo(f"Shared context: {'enabled' if shared_ctx else 'disabled'}", err=True)
         click.echo(f"Interactive mode: {'enabled' if interactive else 'disabled'}", err=True)
 
+        # Import the plan early to extract the goal
+        # We need to set up RUN_DIR placeholder before importing
+        run_dir_value = "." if isolation_mode == "none" else "runs/ISOLATED"  # Will be recalculated by router
+        import_params_with_rundir = dict(import_params)
+        if "RUN_DIR" not in import_params_with_rundir:
+            import_params_with_rundir["RUN_DIR"] = run_dir_value
+        
+        from core.plan_utils import import_plan_from_yaml
+        try:
+            imported_plan = import_plan_from_yaml(plan_path, workdir, params=import_params_with_rundir)
+            goal_from_plan = imported_plan.goal
+        except Exception as exc:
+            click.echo(f"Error: Failed to import plan: {exc}", err=True)
+            sys.exit(1)
+
         state = run_router(
-            goal=task,
+            goal=goal_from_plan,  # Use goal from the plan file
             provider=llm,
             model=model,
             workdir=workdir,
@@ -220,10 +253,12 @@ def register(plugin_manifests: dict) -> CommandManifest:
             isolation_mode=isolation_mode,
             shared_context=shared_ctx,
             export_plan_path=export,
+            import_plan_path=plan_path,
+            import_params=import_params,
             interactive=interactive,
             export_successful_path=export_successful,
         )
-        
+
         # Display statistics
         stats = calculate_run_statistics(state)
         stats_output = format_statistics(stats)
@@ -272,7 +307,7 @@ def register(plugin_manifests: dict) -> CommandManifest:
         )
         sys.exit(1)
 
-    return CommandManifest(name="run", click_command=run_cmd)
+    return CommandManifest(name="exec", click_command=exec_cmd)
 
 
 class _NoAskPlugin(CLIInteractionPlugin):
