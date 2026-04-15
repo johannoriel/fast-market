@@ -30,7 +30,7 @@ def _resolve_path(file_path: str) -> Path:
 
 
 def register(plugin_manifests: dict) -> CommandManifest:
-    @click.command("batch-post")
+    @click.command("batch-comment-post")
     @click.argument("input_file", type=str)
     @click.option(
         "--dry-run",
@@ -185,8 +185,8 @@ def register(plugin_manifests: dict) -> CommandManifest:
 
             # Output results
             if output:
-                output_path = _resolve_path(output)
-                output_path.write_text(
+                # Update the original data with post status
+                Path(output).write_text(
                     json.dumps(results, ensure_ascii=False, default=str)
                     if fmt == "json"
                     else dump_yaml(results)
@@ -200,6 +200,6 @@ def register(plugin_manifests: dict) -> CommandManifest:
             raise
 
     return CommandManifest(
-        name="batch-post",
+        name="batch-comment-post",
         click_command=batch_post_cmd,
     )

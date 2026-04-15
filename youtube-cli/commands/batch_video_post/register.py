@@ -14,23 +14,36 @@ from core.config import load_config
 from core.engine import build_youtube_client
 
 
-def _resolve_path(file_path: str) -> Path:
-    """Resolve relative file path to workdir."""
+def _resolve_input_path(input_file: str) -> Path:
     from common.core.config import load_common_config
 
-    path = Path(file_path)
-    if not path.is_absolute():
+    input_path = Path(input_file)
+    if not input_path.is_absolute():
         common_config = load_common_config()
         workdir = common_config.get("workdir")
         if workdir:
             workdir_path = Path(workdir).expanduser().resolve()
-            return workdir_path / file_path
-        return Path.cwd() / file_path
-    return path
+            return workdir_path / input_file
+        return Path.cwd() / input_file
+    return input_path
+
+
+def _resolve_output_path(output: str) -> Path:
+    from common.core.config import load_common_config
+
+    output_path = Path(output)
+    if not output_path.is_absolute():
+        common_config = load_common_config()
+        workdir = common_config.get("workdir")
+        if workdir:
+            workdir_path = Path(workdir).expanduser().resolve()
+            return workdir_path / output
+        return Path.cwd() / output
+    return output_path
 
 
 def register(plugin_manifests: dict) -> CommandManifest:
-    @click.command("batch-post")
+    @click.command("batch-video-post")
     @click.argument("input_file", type=str)
     @click.option(
         "--dry-run",
@@ -56,21 +69,21 @@ def register(plugin_manifests: dict) -> CommandManifest:
         "--output",
         "-o",
         type=click.Path(),
-        help="Update input file in-place with reply status added to each comment",
+        help="Update input file in-place with reply status added to each video",
     )
     @click.pass_context
-    def batch_post_cmd(ctx, input_file, dry_run, delay, fmt, output, **kwargs):
+    def batch_video_post_cmd(ctx, input_file, dry_run, delay, fmt, output, **kwargs):
         try:
             config = load_config()
             client = build_youtube_client(config)
 
-            # Resolve input file path
-            input_path = _resolve_path(input_file)
+            input_path = _resolve_input_path(input_file)
 
             if not input_path.exists():
                 raise click.ClickException(
                     f"Error: Invalid value for 'INPUT_FILE': Path '{input_file}' does not exist."
                 )
+
             try:
                 data = json.loads(input_path.read_text())
             except json.JSONDecodeError:
@@ -79,54 +92,53 @@ def register(plugin_manifests: dict) -> CommandManifest:
             if not isinstance(data, list):
                 data = [data]
 
-            # Process replies sequentially
             results = []
             errors = []
             total = len(data)
 
             if dry_run:
                 click.echo(
-                    "[DRY RUN] The following replies would be posted:\n", err=True
+                    "[DRY RUN] The following comments would be posted:\n", err=True
                 )
 
             for idx, item in enumerate(data, 1):
                 reply_text = item.get("reply", "")
-                original_comment = item.get("original_comment", {})
-                video_url = item.get("video_url", "")
-                comment_id = original_comment.get("id", "")
-                author = original_comment.get("author", "")
+                video_id = item.get("video_id", "")
+                video_url = item.get("url", "")
+                video_title = item.get("title", "")
 
-                if not reply_text or not comment_id:
-                    err_msg = f"[{idx}/{total}] Missing reply text or comment ID"
+                if not reply_text or not video_id:
+                    err_msg = f"[{idx}/{total}] Missing reply text or video ID"
                     errors.append({"index": idx, "error": err_msg})
                     click.echo(f"  SKIP: {err_msg}", err=True)
                     continue
 
-                # Build status entry
                 entry = {
-                    "video_url": video_url,
-                    "original_comment": original_comment,
+                    "channel_id": item.get("channel_id", ""),
+                    "channel_name": item.get("channel_name", ""),
+                    "video_id": video_id,
+                    "title": video_title,
+                    "url": video_url,
                     "reply": reply_text,
                     "post_status": None,
-                    "reply_id": None,
+                    "comment_id": None,
+                    "moderation_status": None,
                     "error": None,
                 }
 
                 if dry_run:
                     entry["post_status"] = "dry_run"
-                    click.echo(
-                        f"  [{idx}/{total}] Reply to @{author} on {video_url}", err=True
-                    )
+                    click.echo(f"  [{idx}/{total}] Comment on {video_url}", err=True)
                     click.echo(f"    Text: {reply_text[:100]}...", err=True)
                 else:
                     try:
-                        result = client.post_comment_reply(comment_id, reply_text)
+                        result = client.post_comment(video_id, reply_text)
                         if result:
                             entry["post_status"] = "success"
-                            entry["reply_id"] = result.id
+                            entry["comment_id"] = result.id
                             entry["moderation_status"] = result.moderation_status
                             click.echo(
-                                f"  [{idx}/{total}] ✓ Posted reply to @{author} (ID: {result.id})",
+                                f"  [{idx}/{total}] ✓ Posted comment on {video_title} (ID: {result.id})",
                                 err=True,
                             )
                         else:
@@ -135,7 +147,7 @@ def register(plugin_manifests: dict) -> CommandManifest:
                             errors.append(
                                 {
                                     "index": idx,
-                                    "comment_id": comment_id,
+                                    "video_id": video_id,
                                     "error": "API returned no result",
                                 }
                             )
@@ -147,7 +159,7 @@ def register(plugin_manifests: dict) -> CommandManifest:
                         entry["post_status"] = "error"
                         entry["error"] = str(e)
                         errors.append(
-                            {"index": idx, "comment_id": comment_id, "error": str(e)}
+                            {"index": idx, "video_id": video_id, "error": str(e)}
                         )
                         click.echo(
                             f"  [{idx}/{total}] ✗ Error: {e}",
@@ -156,11 +168,9 @@ def register(plugin_manifests: dict) -> CommandManifest:
 
                 results.append(entry)
 
-                # Rate limiting delay
                 if delay > 0 and idx < total:
                     time.sleep(delay)
 
-            # Summary
             success_count = sum(1 for r in results if r["post_status"] == "success")
             failed_count = sum(
                 1 for r in results if r["post_status"] in ("failed", "error")
@@ -169,7 +179,7 @@ def register(plugin_manifests: dict) -> CommandManifest:
 
             click.echo(f"\n--- Summary ---", err=True)
             if dry_run:
-                click.echo(f"  Would post: {dry_count} replies", err=True)
+                click.echo(f"  Would post: {dry_count} comments", err=True)
             else:
                 click.echo(f"  Posted: {success_count}/{total}", err=True)
                 if failed_count:
@@ -179,13 +189,12 @@ def register(plugin_manifests: dict) -> CommandManifest:
                 click.echo(f"\n--- Error Report ({len(errors)} errors) ---", err=True)
                 for err in errors:
                     click.echo(
-                        f"  [{err['index']}] {err.get('comment_id', 'N/A')}: {err['error']}",
+                        f"  [{err['index']}] {err.get('video_id', 'N/A')}: {err['error']}",
                         err=True,
                     )
 
-            # Output results
             if output:
-                output_path = _resolve_path(output)
+                output_path = _resolve_output_path(output)
                 output_path.write_text(
                     json.dumps(results, ensure_ascii=False, default=str)
                     if fmt == "json"
@@ -200,6 +209,6 @@ def register(plugin_manifests: dict) -> CommandManifest:
             raise
 
     return CommandManifest(
-        name="batch-post",
-        click_command=batch_post_cmd,
+        name="batch-video-post",
+        click_command=batch_video_post_cmd,
     )

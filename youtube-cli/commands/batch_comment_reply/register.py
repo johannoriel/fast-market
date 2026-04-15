@@ -14,7 +14,7 @@ from common.core.config import load_tool_config, load_common_config
 from common.core.yaml_utils import dump_yaml
 from common.llm.base import LLMRequest
 from common.llm.registry import discover_providers, get_default_provider_name
-from commands.batch_reply.prompt_processor import (
+from commands.batch_comment_reply.prompt_processor import (
     process_prompts,
     PromptProcessorError,
 )
@@ -30,7 +30,7 @@ def _detect_format_from_filename(filename: str) -> str:
 
 
 def register(plugin_manifests: dict) -> CommandManifest:
-    @click.command("batch-reply")
+    @click.command("batch-comment-reply")
     @click.argument("input_file", type=str)
     @click.option(
         "--prompt",
@@ -127,19 +127,12 @@ def register(plugin_manifests: dict) -> CommandManifest:
         # Resolve input file path
         input_path = Path(input_file)
         if not input_path.is_absolute():
-            # First, try the configured workdir
             common_config = load_common_config()
             workdir = common_config.get("workdir")
             if workdir:
                 workdir_path = Path(workdir).expanduser().resolve()
-                workdir_input = workdir_path / input_file
-                if workdir_input.exists():
-                    input_path = workdir_input
-                else:
-                    # Fall back to current working directory
-                    input_path = Path.cwd() / input_file
+                input_path = workdir_path / input_file
             else:
-                # No workdir configured, use current directory
                 input_path = Path.cwd() / input_file
 
         if not input_path.exists():
@@ -406,6 +399,6 @@ def register(plugin_manifests: dict) -> CommandManifest:
             out(results, fmt if fmt else "json")
 
     return CommandManifest(
-        name="batch-reply",
+        name="batch-comment-reply",
         click_command=batch_reply_cmd,
     )

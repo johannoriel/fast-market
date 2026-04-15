@@ -14,14 +14,13 @@ from common.core.config import load_tool_config, load_common_config
 from common.core.yaml_utils import dump_yaml
 from common.llm.base import LLMRequest
 from common.llm.registry import discover_providers, get_default_provider_name
-from commands.batch_reply.prompt_processor import (
+from commands.batch_video_reply.prompt_processor import (
     process_prompts,
     PromptProcessorError,
 )
 
 
 def _detect_format_from_filename(filename: str) -> str:
-    """Auto-detect output format from file extension."""
     if filename.endswith(".yaml") or filename.endswith(".yml"):
         return "yaml"
     elif filename.endswith(".json"):
@@ -29,8 +28,35 @@ def _detect_format_from_filename(filename: str) -> str:
     return "text"
 
 
+def _resolve_input_path(input_file: str) -> Path:
+    input_path = Path(input_file)
+    if not input_path.is_absolute():
+        common_config = load_common_config()
+        workdir = common_config.get("workdir")
+        if workdir:
+            workdir_path = Path(workdir).expanduser().resolve()
+            workdir_input = workdir_path / input_file
+            if workdir_input.exists():
+                return workdir_input
+            return Path.cwd() / input_file
+        return Path.cwd() / input_file
+    return input_path
+
+
+def _resolve_output_path(output: str) -> Path:
+    output_path = Path(output)
+    if not output_path.is_absolute():
+        common_config = load_common_config()
+        workdir = common_config.get("workdir")
+        if workdir:
+            workdir_path = Path(workdir).expanduser().resolve()
+            return workdir_path / output
+        return Path.cwd() / output
+    return output_path
+
+
 def register(plugin_manifests: dict) -> CommandManifest:
-    @click.command("batch-reply")
+    @click.command("batch-video-reply")
     @click.argument("input_file", type=str)
     @click.option(
         "--prompt",
@@ -38,7 +64,7 @@ def register(plugin_manifests: dict) -> CommandManifest:
         multiple=True,
         help="Prompt template for generating replies (LLM mode). Can be used multiple times. "
         "Supports @filename to include file contents, @- for stdin, "
-        "and template variables like {URL}, {AUTHOR}, {COMMENT}. "
+        "and template variables like {VIDEO_TITLE}, {VIDEO_DESCRIPTION}, {TRANSCRIPT}. "
         "Use --shell for custom command mode.",
     )
     @click.option(
@@ -46,8 +72,8 @@ def register(plugin_manifests: dict) -> CommandManifest:
         "-s",
         type=str,
         default=None,
-        help="Shell command to generate replies. Receives comment via env vars: "
-        "AUTHOR, COMMENT, VIDEO_URL, VIDEO_ID, VIDEO_TITLE, COMMENT_ID. "
+        help="Shell command to generate replies. Receives video data via env vars: "
+        "VIDEO_URL, VIDEO_ID, VIDEO_TITLE, VIDEO_DESCRIPTION, CHANNEL_NAME, CHANNEL_ID, TRANSCRIPT. "
         "Output should be plain text reply.",
     )
     @click.option(
@@ -70,7 +96,7 @@ def register(plugin_manifests: dict) -> CommandManifest:
         "filter_ids",
         type=str,
         default=None,
-        help="JSON list of comment IDs to process. In rewrite mode, specifies which replies to regenerate.",
+        help="JSON list of video IDs to process. In rewrite mode, specifies which replies to regenerate.",
     )
     @click.option(
         "--rewrite",
@@ -81,7 +107,7 @@ def register(plugin_manifests: dict) -> CommandManifest:
     )
     @click.option("--output", "-o", type=click.Path(), help="Save to file")
     @click.pass_context
-    def batch_reply_cmd(
+    def batch_video_reply_cmd(
         ctx,
         input_file,
         prompt,
@@ -93,7 +119,6 @@ def register(plugin_manifests: dict) -> CommandManifest:
         output,
         **kwargs,
     ):
-        # Validate rewrite options
         if rewrite and not output:
             click.echo("Error: --rewrite requires --output", err=True)
             return
@@ -102,14 +127,13 @@ def register(plugin_manifests: dict) -> CommandManifest:
             click.echo("Error: --rewrite requires --filter", err=True)
             return
 
-        # Parse filter_ids
         filter_ids_set = None
         if filter_ids:
             try:
                 filter_ids_list = json.loads(filter_ids)
                 if not isinstance(filter_ids_list, list):
                     click.echo(
-                        "Error: --filter must be a JSON list of comment IDs",
+                        "Error: --filter must be a JSON list of video IDs",
                         err=True,
                     )
                     return
@@ -117,30 +141,14 @@ def register(plugin_manifests: dict) -> CommandManifest:
             except json.JSONDecodeError as e:
                 click.echo(f"Error: --filter contains invalid JSON: {e}", err=True)
                 return
-        # Parse metadata into dict
+
         metadata_dict = {}
         for m in metadata:
             if "=" in m:
                 key, value = m.split("=", 1)
                 metadata_dict[key] = value
 
-        # Resolve input file path
-        input_path = Path(input_file)
-        if not input_path.is_absolute():
-            # First, try the configured workdir
-            common_config = load_common_config()
-            workdir = common_config.get("workdir")
-            if workdir:
-                workdir_path = Path(workdir).expanduser().resolve()
-                workdir_input = workdir_path / input_file
-                if workdir_input.exists():
-                    input_path = workdir_input
-                else:
-                    # Fall back to current working directory
-                    input_path = Path.cwd() / input_file
-            else:
-                # No workdir configured, use current directory
-                input_path = Path.cwd() / input_file
+        input_path = _resolve_input_path(input_file)
 
         if not input_path.exists():
             click.echo(
@@ -149,30 +157,18 @@ def register(plugin_manifests: dict) -> CommandManifest:
             )
             return
 
-        # Resolve output file path if provided
         if output:
-            output_path = Path(output)
-            if not output_path.is_absolute():
-                # Use workdir if configured, otherwise current directory
-                common_config = load_common_config()
-                workdir = common_config.get("workdir")
-                if workdir:
-                    workdir_path = Path(workdir).expanduser().resolve()
-                    output_path = workdir_path / output
-                else:
-                    output_path = Path.cwd() / output
+            output_path = _resolve_output_path(output)
             output = str(output_path)
 
-        # Determine generation mode
         use_shell = bool(shell)
         use_llm = bool(prompt) and not use_shell
-        use_shell_with_prompt = use_shell and prompt  # Shell mode with prompt variables
+        use_shell_with_prompt = use_shell and prompt
 
         if not use_shell and not prompt:
             click.echo("Error: Either --prompt or --shell is required", err=True)
             return
 
-        # Initialize provider if using LLM mode
         provider = None
         if use_llm:
             config = load_tool_config("youtube")
@@ -190,7 +186,6 @@ def register(plugin_manifests: dict) -> CommandManifest:
                 )
                 return
 
-        # Read input file
         try:
             data = json.loads(input_path.read_text())
         except json.JSONDecodeError:
@@ -199,26 +194,23 @@ def register(plugin_manifests: dict) -> CommandManifest:
         if not isinstance(data, list):
             data = [data]
 
-        # Handle rewrite mode
         if rewrite:
-            # Input is existing results, not raw comments
-            # We need to regenerate only the specified IDs
             existing_results = data
             existing_map = {
-                item.get("original_comment", {}).get("id"): idx
+                item.get("video_id"): idx
                 for idx, item in enumerate(existing_results)
-                if item.get("original_comment", {}).get("id")
+                if item.get("video_id")
             }
 
-            # Process only the filtered IDs
             data_to_process = []
-            for comment_id in filter_ids_set:
-                if comment_id in existing_map:
-                    idx = existing_map[comment_id]
-                    data_to_process.append(existing_results[idx]["original_comment"])
+            for video_id in filter_ids_set:
+                if video_id in existing_map:
+                    idx = existing_map[video_id]
+                    data_to_process.append(existing_results[idx])
                 else:
                     click.echo(
-                        f"Warning: ID {comment_id} not found in input file", err=True
+                        f"Warning: Video ID {video_id} not found in input file",
+                        err=True,
                     )
 
             if not data_to_process:
@@ -230,62 +222,60 @@ def register(plugin_manifests: dict) -> CommandManifest:
             )
             data = data_to_process
         else:
-            # Apply filter if provided (only in non-rewrite mode)
             if filter_ids:
                 try:
                     filter_list = json.loads(filter_ids)
                     if not isinstance(filter_list, list):
                         click.echo(
-                            "Error: --filter must be a JSON list of comment IDs",
+                            "Error: --filter must be a JSON list of video IDs",
                             err=True,
                         )
                         return
                     filter_set = set(filter_list)
-                    data = [item for item in data if item.get("id") in filter_set]
+                    data = [item for item in data if item.get("video_id") in filter_set]
                     click.echo(
-                        f"Filtered to {len(data)} comments matching filter IDs",
+                        f"Filtered to {len(data)} videos matching filter IDs",
                         err=True,
                     )
                 except json.JSONDecodeError as e:
                     click.echo(f"Error: --filter contains invalid JSON: {e}", err=True)
                     return
 
-        # Process comments sequentially
         results = []
         total = len(data)
         for idx, item in enumerate(data, 1):
-            comment_text = item.get("text", "")
-            author = item.get("author", "")
-            video_url = item.get("video_url", "")
             video_id = item.get("video_id", "")
-            video_title = item.get("video_title", "")
-            comment_id = item.get("id", "")
+            video_url = item.get("url", "")
+            video_title = item.get("title", "")
+            description = item.get("description", "")
+            channel_name = item.get("channel_name", "")
+            channel_id = item.get("channel_id", "")
+            transcript = item.get("transcript", "")
+            published_at = item.get("published_at", "")
 
-            if not comment_text:
+            if not video_id:
                 continue
 
             reply_text = None
             error = None
 
             if use_shell:
-                # Build the actual command to execute
                 actual_command = shell
 
-                # If using shell with prompt variables, append them as command-line arguments
                 if use_shell_with_prompt and prompt:
                     prompt_args = " ".join(prompt)
                     actual_command = f"{shell} {prompt_args}"
 
-                # Execute shell command with env vars
                 env = {
                     **os.environ,
-                    "AUTHOR": author,
-                    "COMMENT": comment_text,
-                    "COMMENT_TEXT": comment_text,
                     "VIDEO_URL": video_url,
                     "VIDEO_ID": video_id,
                     "VIDEO_TITLE": video_title,
-                    "COMMENT_ID": comment_id,
+                    "VIDEO_DESCRIPTION": description,
+                    "CHANNEL_NAME": channel_name,
+                    "CHANNEL_ID": channel_id,
+                    "TRANSCRIPT": transcript,
+                    "PUBLISHED_AT": published_at,
                 }
 
                 try:
@@ -308,7 +298,6 @@ def register(plugin_manifests: dict) -> CommandManifest:
                 except Exception as e:
                     error = str(e)
             else:
-                # Use LLM mode
                 try:
                     processed_prompt = process_prompts(
                         prompts=list(prompt),
@@ -320,7 +309,7 @@ def register(plugin_manifests: dict) -> CommandManifest:
                     click.echo(f"[{idx}/{total}] {error}", err=True)
 
                 if not error:
-                    user_prompt = f"{processed_prompt}\n\n---\nComment by: {author}\nVideo: {video_url}\nComment: {comment_text}\n---\n\nGenerate a reply:"
+                    user_prompt = f"{processed_prompt}\n\n---\nVideo title: {video_title}\nChannel: {channel_name}\nDescription: {description}\nTranscript:\n{transcript}\n---\n\nGenerate a reply:"
                     request = LLMRequest(
                         prompt=user_prompt,
                         temperature=0.7,
@@ -332,10 +321,15 @@ def register(plugin_manifests: dict) -> CommandManifest:
                     except Exception as e:
                         error = f"LLM error: {e}"
 
-            # Build result entry with full original data
             result = {
-                "video_url": video_url,
-                "original_comment": item,
+                "channel_id": channel_id,
+                "channel_name": channel_name,
+                "video_id": video_id,
+                "title": video_title,
+                "description": description,
+                "url": video_url,
+                "published_at": published_at,
+                "transcript": transcript,
                 "reply": reply_text,
             }
             if metadata_dict:
@@ -346,16 +340,14 @@ def register(plugin_manifests: dict) -> CommandManifest:
 
             if error:
                 click.echo(
-                    f"[{idx}/{total}] Error for comment by {author}: {error}", err=True
+                    f"[{idx}/{total}] Error for video {video_id}: {error}", err=True
                 )
             else:
                 click.echo(
-                    f"[{idx}/{total}] Generated reply for comment by {author}", err=True
+                    f"[{idx}/{total}] Generated reply for video {video_id}", err=True
                 )
 
-        # Output results
         if rewrite:
-            # Read original input file again to preserve non-regenerated entries
             try:
                 original_data = json.loads(input_path.read_text())
             except json.JSONDecodeError:
@@ -364,18 +356,13 @@ def register(plugin_manifests: dict) -> CommandManifest:
             if not isinstance(original_data, list):
                 original_data = [original_data]
 
-            # Build map of regenerated results by comment ID
-            regenerated_map = {
-                item.get("original_comment", {}).get("id"): item for item in results
-            }
+            regenerated_map = {item.get("video_id"): item for item in results}
 
-            # Merge: keep original for non-regenerated, use new for regenerated
             merged = []
             for item in original_data:
-                comment_id = item.get("original_comment", {}).get("id")
-                if comment_id in regenerated_map:
-                    new_item = regenerated_map[comment_id]
-                    # Preserve original metadata
+                video_id = item.get("video_id")
+                if video_id in regenerated_map:
+                    new_item = regenerated_map[video_id]
                     original_metadata = item.get("metadata", {})
                     if original_metadata:
                         new_item["metadata"] = original_metadata
@@ -383,11 +370,9 @@ def register(plugin_manifests: dict) -> CommandManifest:
                 else:
                     merged.append(item)
 
-            # Write to output file
             output_path = Path(output)
             output_path.write_text(json.dumps(merged, ensure_ascii=False, default=str))
             click.echo(f"Updated {len(results)} replies in {output}", err=True)
-            click.echo(f"Updated {len(results)} replies in {input_file}", err=True)
         elif output:
             output_fmt = fmt if fmt else _detect_format_from_filename(output)
 
@@ -406,6 +391,6 @@ def register(plugin_manifests: dict) -> CommandManifest:
             out(results, fmt if fmt else "json")
 
     return CommandManifest(
-        name="batch-reply",
-        click_command=batch_reply_cmd,
+        name="batch-video-reply",
+        click_command=batch_video_reply_cmd,
     )
